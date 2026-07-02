@@ -1,0 +1,4 @@
+Hierin worden alle nodige python code voor het oplossen van de gemeente graaf door middel van Benders decompositie gestopt. 
+
+BendersModel.py is de volledige code voor als je alles in 1 keer wil runnen. Let op, je hebt hier uit het mapje data 'gemeente_graph_length_sorted.graphml' nodig. 
+Voor de rest zijn alle functies met docstrings los geüpload. Hierbij zijn kleine hulpfuncties in 1 python file gestopt. 
