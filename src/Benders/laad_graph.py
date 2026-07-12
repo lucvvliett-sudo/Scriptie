@@ -14,7 +14,7 @@ max_run_time = 7200
 ORIGIN_DESTINATION_CAN_CHARGE = False
 
 
-def load_graph(path):
+def laad_graph(path):
         """
         Lees een gemeentegraaf in vanuit een GraphML-bestand.
         De graaf wordt ingelezen met NetworkX. Omdat GraphML-attributen vaak als
