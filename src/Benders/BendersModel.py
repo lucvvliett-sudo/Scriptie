@@ -6,15 +6,13 @@ import time
 
 
 GRAPH_PATH = os.path.join(os.path.dirname(__file__), "gemeente_graph_length_sorted.graphml")
-
 GEMEENTE_SCENARIOS = (30, 82)
 ACTIERADIUS_SCENARIOS = (200,250)
 max_iterations = 350
-max_run_time = 7200 
-ORIGIN_DESTINATION_CAN_CHARGE = False
+max_runtime = 7200 
 
 
-def load_graph(path):
+def laad_graph(path):
     graph = nx.read_graphml(path)
 
     for _, data in graph.nodes(data=True):
@@ -28,50 +26,36 @@ def load_graph(path):
     return graph
 
 
-def top_population_nodes(graph, top_n):
+def top_gemeenten(graph, top_n):
     return sorted(
         graph.nodes,
         key=lambda node: graph.nodes[node].get("inwoners", 0),
         reverse=True,
     )[:top_n]
 
-
-def path_distance(graph, path):
-    return sum(
-        graph.edges[from_node, to_node]["distance_km"]
-        for from_node, to_node in zip(path, path[1:])
-    )
-
-
-def cumulative_path_distances(graph, path):
-    distances = [0]
-    total = 0
-    for from_node, to_node in zip(path, path[1:]):
-        total += graph.edges[from_node, to_node]["distance_km"]
-        distances.append(total)
-    return distances
-
-
-def build_od_routes(graph, od_nodes):
+def OD_routes(graph, od_nodes):
     routes = []
     for route_index, (origin, destination) in enumerate(itertools.combinations(od_nodes, 2)):
-        try:
-            path = nx.shortest_path(
-                graph,
-                origin,
-                destination,
-                weight="distance_km",
-            )
-        except nx.NetworkXNoPath:
-            continue
+        #Maak hier het kortste pad aan de hand van Dijkstra's algoritme.
+        path = nx.shortest_path(
+            graph,
+            origin,
+            destination,
+            weight="distance_km")
 
-        distance = path_distance(graph, path)
-        if distance <= 0:
-            continue
+        afstand = sum(
+            graph.edges[from_node, to_node]["distance_km"]
+            for from_node, to_node in zip(path, path[1:]))
 
         inwoners_origin = graph.nodes[origin]["inwoners"]
         inwoners_destination = graph.nodes[destination]["inwoners"]
-        raw_flow = (inwoners_origin * inwoners_destination) / distance
+        verkeersvraag = (inwoners_origin * inwoners_destination) / afstand
+
+        cumdist = [0]
+        totaal = 0
+        for from_node, to_node in zip(path, path[1:]):
+            totaal += graph.edges[from_node, to_node]["distance_km"]
+            cumdist.append(totaal)
 
         routes.append({
             "id": f"r{route_index}",
@@ -79,228 +63,206 @@ def build_od_routes(graph, od_nodes):
             "origin": origin,
             "destination": destination,
             "path": path,
-            "cumdist": cumulative_path_distances(graph, path),
-            "distance_km": distance,
-            "raw_flow": raw_flow,
-        })
-
+            "cumdist": cumdist,
+            "afstand": afstand,
+            "verkeersvraag": verkeersvraag})
     return routes
 
 
-
-def route_is_covered(route, selected_stations, vehicle_range_km):
+def route_gedekt(route, selected_stat, actieradius):
     path = route["path"]
     cumdist = route["cumdist"]
-    destination_index = len(path) - 1
-    station_indices = {
-        index
-        for index, node in enumerate(path)
-        if node in selected_stations
-    }
-
-    if ORIGIN_DESTINATION_CAN_CHARGE:
-        station_indices.add(0)
-        station_indices.add(destination_index)
+    station_indices = {index for index, node in enumerate(path) 
+    if node in selected_stat}
 
     if not station_indices:
         return False
 
-    half_range = vehicle_range_km / 2
-    reachable_stations = set()
+    half_range = actieradius / 2
+    haalbaar = set()
 
     for index in station_indices:
-        distance_from_origin = cumdist[index]
-        if distance_from_origin <= half_range:
-            reachable_stations.add(index)
+        afst_origin = cumdist[index]
+        if afst_origin <= half_range:
+            haalbaar.add(index)
 
-    if 0 in station_indices:
-        reachable_stations.add(0)
+    for index in sorted(station_indices):
+        if index in haalbaar:
+            continue
 
-    changed = True
+        for vorige_index in sorted(haalbaar):
+            afstand = cumdist[index] - cumdist[vorige_index]
 
-    while changed:
-        changed = False
-        for index in sorted(station_indices):
-            if index in reachable_stations:
-                continue
+            if 0 <= afstand <= actieradius:
+                haalbaar.add(index)
+                break
 
-            can_reach_index = any(
-                cumdist[index] >= cumdist[reachable_index]
-                and cumdist[index] - cumdist[reachable_index] <= vehicle_range_km
-                for reachable_index in reachable_stations
-            )
-            if can_reach_index:
-                reachable_stations.add(index)
-                changed = True
-
-    if destination_index in station_indices:
+    D_index = len(path) - 1
+    #rekening houden met de 50% aanname wanneer er geen station op D staat
+    if D_index in station_indices:
         return any(
-            cumdist[destination_index] >= cumdist[reachable_index]
-            and cumdist[destination_index] - cumdist[reachable_index] <= vehicle_range_km
-            for reachable_index in reachable_stations
+            cumdist[D_index] >= cumdist[index]
+            and cumdist[D_index] - cumdist[index] <= actieradius
+            for index in haalbaar
         )
 
     return any(
-        cumdist[destination_index] >= cumdist[reachable_index]
-        and cumdist[destination_index] - cumdist[reachable_index] <= half_range
-        for reachable_index in reachable_stations
+        cumdist[D_index] >= cumdist[index]
+        and cumdist[D_index] - cumdist[index] <= half_range
+        for index in haalbaar
     )
 
 
-def evaluate_route_coverage(routes, selected_stations, vehicle_range_km):
+def info_dekking(routes, selected_stat, actieradius):
     covered_routes = 0
-    actual_objective = 0.0
+    somverkeer = 0.0
 
     for route in routes:
-        if route_is_covered(route, selected_stations, vehicle_range_km):
+        if route_gedekt(route, selected_stat, actieradius):
             covered_routes += 1
-            actual_objective += route["raw_flow"]
+            somverkeer += route["verkeersvraag"]
 
-    return covered_routes, actual_objective
+    return covered_routes, somverkeer
 
 
-def route_subproblem_dual_cut(route, station_values, vehicle_range_km):
+def subprobleem_en_cuts(route, x_waarden, actieradius):
     path = route["path"]
     cumdist = route["cumdist"]
-    destination_index = len(path) - 1
-    half_range = vehicle_range_km / 2
+    half_range = actieradius / 2
 
     network = nx.DiGraph()
     source = "source"
     sink = "sink"
-    inf_capacity = len(path) + 1
+    inf_cap = len(path) + 1
 
-    for index, node in enumerate(path):
-        node_capacity = float(station_values.get(node, 0.0))
-        network.add_edge((index, "in"), (index, "out"), capacity=node_capacity)
+    for i, node in enumerate(path):
+        node_cap = float(x_waarden.get(node, 0.0))
+        network.add_edge((i, "in"), (i, "uit"), capacity=node_cap)
 
-    network.add_edge((destination_index, "out"), sink, capacity=inf_capacity)
+    des_index = len(path) - 1
+    network.add_edge((des_index, "uit"), sink, capacity=inf_cap)
 
     for to_index in range(1, len(path)):
         if cumdist[to_index] <= half_range:
-            network.add_edge(source, (to_index, "in"), capacity=inf_capacity)
+            network.add_edge(source, (to_index, "in"), capacity=inf_cap)
 
-    network.add_edge(source, (0, "in"), capacity=inf_capacity)
+    network.add_edge(source, (0, "in"), capacity=inf_cap)
 
     for from_index in range(len(path) - 1):
         for to_index in range(from_index + 1, len(path)):
             distance = cumdist[to_index] - cumdist[from_index]
-            if distance > vehicle_range_km:
+            if distance > actieradius:
                 continue
 
             network.add_edge(
-                (from_index, "out"),
+                (from_index, "uit"),
                 (to_index, "in"),
-                capacity=inf_capacity,
-            )
+                capacity=inf_cap)
 
-            if to_index == destination_index and distance <= half_range:
+            if to_index == des_index and distance <= half_range:
                 network.add_edge(
-                    (from_index, "out"),
+                    (from_index, "uit"),
                     sink,
-                    capacity=inf_capacity,
-                )
-
+                    capacity=inf_cap)
+    #Hier wordt de maximale flow berekend met networkx.
     max_flow_value, _ = nx.maximum_flow(network, source, sink, capacity="capacity")
     if max_flow_value >= 1 - 1e-7:
         return max_flow_value, None
 
-    min_cut_value, (reachable_side, unreachable_side) = nx.minimum_cut(
+    #Hier wordt de minimale cut berekend met networkx.
+    min_cut_value, (s_side, t_side) = nx.minimum_cut(
         network,
         source,
-        sink
-    )
+        sink)
 
     cut_nodes = []
-    constant_capacity = 0.0
-    for from_node in reachable_side:
-        for to_node, edge_data in network[from_node].items():
-            if to_node not in unreachable_side:
-                continue
+    const_cap = 0
 
-            is_node_capacity_edge = (
+    for from_node in s_side:
+        for to_node, edge_data in network[from_node].items():
+            if to_node not in t_side:
+                continue
+#Hier wordt gecontroleerd of de edge tussen in en uit knoop zit en niet de sink of source is
+            cut_edges = (
                 isinstance(from_node, tuple)
                 and isinstance(to_node, tuple)
                 and from_node[1] == "in"
-                and to_node[1] == "out"
-                and from_node[0] == to_node[0]
-            )
-            if is_node_capacity_edge:
+                and to_node[1] == "uit"
+                and from_node[0] == to_node[0])
+
+            if cut_edges:
                 route_index = from_node[0]
                 cut_nodes.append(path[route_index])
-            elif edge_data["capacity"] < inf_capacity:
-                constant_capacity += edge_data["capacity"]
+            elif edge_data["capacity"] < inf_cap:
+                const_cap += edge_data["capacity"]
 
-    if constant_capacity >= 1 - 1e-7:
+    if const_cap >= 1 - 1e-7:
         return min_cut_value, None
 
     return min_cut_value, sorted(set(cut_nodes))
 
 
-def build_master_problem(station_nodes, routes, cuts, station_budget, initial_stations=None):
+def master_probleem(nodes, routes, cuts, budget, initial_stat):
     model = pulp.LpProblem("FRLM_Benders_Master", pulp.LpMaximize)
 
     x = {
         node: pulp.LpVariable(f"x_{node}", cat="Binary")
-        for node in station_nodes
-    }
+        for node in nodes}
     y = {
         route["id"]: pulp.LpVariable(f"y_{route['id']}", lowBound=0, upBound=1, cat="Continuous")
-        for route in routes
-    }
+        for route in routes}
 
-    total_flow = sum(route["raw_flow"] for route in routes)
-    if initial_stations is not None:
+    totale_flow = sum(route["verkeersvraag"] for route in routes)
+    if initial_stat is not None:
         for node, variable in x.items():
-            variable.setInitialValue(1 if node in initial_stations else 0)
-    if total_flow > 0:
-        model += pulp.lpSum(route["raw_flow"] * y[route["id"]] for route in routes)/total_flow
-    else:
-        model+=0
-    
-    model += pulp.lpSum(x.values()) <= station_budget
+            variable.setInitialValue(1 if node in initial_stat else 0)
+    if totale_flow >0:        
+        model += pulp.lpSum(route["verkeersvraag"] * y[route["id"]] for route in routes)/totale_flow
+    else: 
+        model += 0
 
-    for cut_index, (route_id, candidate_nodes) in enumerate(cuts):
-        if candidate_nodes:
+    model += pulp.lpSum(x.values()) <= budget
+
+    for cut_index, (route_id, candidates) in enumerate(cuts):
+        if candidates:
             model += (
-                pulp.lpSum(x[node] for node in candidate_nodes) >= y[route_id],
-                f"benders_cut_{cut_index}",
-            )
+                pulp.lpSum(x[node] for node in candidates) >= y[route_id],
+                f"benders_cut_{cut_index}")
         else:
-            model += y[route_id] <= 0, f"benders_no_cover_cut_{cut_index}"
+            model += y[route_id] <= 0, f"lege_benders_cut_{cut_index}"
 
     return model, x, y
 
 
-def solve_benders(graph, routes, station_budget, vehicle_range_km, max_iterations, max_run_time):
+def run_benders(routes, budget, actieradius, max_iterations, max_runtime):
     cuts = []
-    cut_keys = set()
-    station_nodes = sorted({node for route in routes for node in route["path"]})
-    start_time = time.perf_counter()
-    objective_value = 0.0
-    actual_objective = 0.0
+    cut_check = set()
+    nodes = sorted({node for route in routes for node in route["path"]})
+    start = time.perf_counter()
+    objective = 0.0
+    sum_obj= 0.0
     status = "UNKNOWN"
-    selected_stations = set()
+    selected_stat= set()
     covered_routes = 0
     iteration = 0
 
     for iteration in range(1, max_iterations + 1):
-        elapsed = time.perf_counter() - start_time
-        if elapsed >= max_run_time:
+        elapsed = time.perf_counter() - start
+        if elapsed >= max_runtime:
             print(f"Tijdslimiet bereikt na {elapsed:.1f} seconden.")
             status = "TIME_LIMIT"
             break
 
-        remaining_time = max_run_time - elapsed
-
+        remaining= max_runtime - elapsed
+        #Per model kan hier de tijdslimiet en de gap worden aangepast per iteratie
         if iteration == 1:
-            time_limit = max(30, int(remaining_time * 0.3))
+            time_limit = max(30, int(remaining * 0.3))
             gap_rel = 0.05
         elif iteration==2 or iteration==3:
-            time_limit = max(30, int(remaining_time*0.2))
+            time_limit = max(30, int(remaining * 0.2))
             gap_rel = 0.02
         else:
-            time_limit= max(30, int(remaining_time*0.1))
+            time_limit= max(30, int(remaining*0.1))
             gap_rel=0.01
         
         solver = pulp.PULP_CBC_CMD(
@@ -308,115 +270,111 @@ def solve_benders(graph, routes, station_budget, vehicle_range_km, max_iteration
             timeLimit=time_limit,
             gapRel=gap_rel,
             threads=4,
-            warmStart=True,
-        )
+            warmStart=True)
 
-        model, x, y = build_master_problem(
-            station_nodes,
+        model, x, y = master_probleem(
+            nodes,
             routes,
             cuts,
-            station_budget,
-            initial_stations=selected_stations,
-        )
+            budget,
+            initial_stat=selected_stat)
+        
         model.solve(solver)
 
         status = pulp.LpStatus[model.status]
         if status not in {"Optimal", "Not Solved"}:
             break
 
-        selected_stations = {
+        selected_stat = {
             node
             for node, variable in x.items()
-            if pulp.value(variable) > 0.5
-        }
-        station_values = {
+            if pulp.value(variable) > 0.5}
+        stat_val = {
             node: pulp.value(variable) or 0.0
-            for node, variable in x.items()
-        }
+            for node, variable in x.items()}
 
         new_cuts = []
         for route in routes:
-            route_selected = (pulp.value(y[route["id"]]) or 0.0) > 0.5
-            if not route_selected:
+            check_gedekt = pulp.value(y[route["id"]] or 0.0) > 0.5
+            if not check_gedekt:
                 continue
-
-            subproblem_value, candidate_nodes = route_subproblem_dual_cut(
+            
+            #Check voor het subprobleem of de route gedekt is  met de huidige stationwaarden en actieradius. 
+            #Als de waarde van het subprobleem groter is dan 1, wordt er geen cut toegevoegd.
+            sub_waarde, kandidaat = subprobleem_en_cuts(
                 route,
-                station_values,
-                vehicle_range_km
-            )
-            if subproblem_value >= 1 - 1e-7:
+                stat_val,
+                actieradius)
+            
+            
+            if sub_waarde >= 1 - 1e-7:
                 continue
 
-            candidate_nodes = tuple(candidate_nodes or ())
-            cut = (route["id"], candidate_nodes)
-            if cut not in cut_keys:
-                cut_keys.add(cut)
+            kandidaat = tuple(kandidaat or ()) 
+            cut = (route["id"], kandidaat)
+            if cut not in cut_check:
+                cut_check.add(cut)
                 new_cuts.append(cut)
 
-        objective_value = pulp.value(model.objective) or 0.0
-        covered_routes, actual_objective = evaluate_route_coverage(
+        objective = pulp.value(model.objective) or 0.0
+        covered_routes, sum_obj = info_dekking(
             routes,
-            selected_stations,
-            vehicle_range_km,
+            selected_stat,
+            actieradius,
         )
 
         if not new_cuts:
-            elapsed = time.perf_counter() - start_time
+            elapsed = time.perf_counter() - start
             return {
-                "objective": objective_value,
-                "selected_stations": selected_stations,
+                "objective": objective,
+                "selected_stations": selected_stat,
                 "covered_routes": covered_routes,
                 "routes": routes,
                 "cuts": cuts,
                 "iterations": iteration,
                 "runtime": elapsed,
                 "status": status,
-                "actual_objective": actual_objective,
-            }
+                "sum_obj": sum_obj}
 
         cuts.extend(new_cuts)
 
-    elapsed = time.perf_counter() - start_time
+    elapsed = time.perf_counter() - start
     return {
-        "objective": objective_value,
-        "selected_stations": selected_stations,
+        "objective": objective,
+        "selected_stations": selected_stat,
         "covered_routes": covered_routes,
         "routes": routes,
         "cuts": cuts,
         "iterations": iteration,
         "runtime": elapsed,
         "status": status,
-        "actual_objective": actual_objective,
-    }
+        "sum_obj": sum_obj}
 
 
 def main():
-    graph = load_graph(GRAPH_PATH)
+    graph = laad_graph(GRAPH_PATH)
     for aantal_gemeenten in GEMEENTE_SCENARIOS:
-        od_nodes = top_population_nodes(graph, aantal_gemeenten)
-        routes = build_od_routes(graph, od_nodes)
+        od_nodes = top_gemeenten(graph, aantal_gemeenten)
+        routes = OD_routes(graph, od_nodes)
 
-        for station_budget in (60, 70):
-            for vehicle_range_km in ACTIERADIUS_SCENARIOS:
+        #pas hier de stationbudget aan voor gewenste aantal te plaatsen stations
+        for station_budget in range(1,11):
+            for actieradius in ACTIERADIUS_SCENARIOS:
                 print("\n" + "=" * 60)
                 print(
                     f"Top {aantal_gemeenten} gemeenten, "
                     f"stations={station_budget}, "
-                    f"actieradius={vehicle_range_km}"
-                )
+                    f"actieradius={actieradius}")
 
-                result = solve_benders(
-                    graph,
+                result = run_benders(
                     routes,
                     station_budget,
-                    vehicle_range_km,
+                    actieradius,
                     max_iterations=max_iterations,
-                    max_run_time=max_run_time,
-                )
+                    max_runtime=max_runtime)
 
                 print(f"Master Objective (top {aantal_gemeenten}): {result['objective']}")
-                print(f"Actual Objective (top {aantal_gemeenten}): {result['actual_objective']}")
+                print(f"Som verkeersvraag (top {aantal_gemeenten}): {result['sum_obj']}")
                 print(f"Gedekt top {aantal_gemeenten}: {result['covered_routes']}/{len(routes)}")
                 print("Stations:", sorted(result["selected_stations"]))
                 print(f"geplaatste stations: {len(result['selected_stations'])}")
